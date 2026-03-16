@@ -1,0 +1,2699 @@
+schema_discovery/candidates/ind_unary_soft.py:
+
+# schema_discovery/candidates/ind_unary_soft.py
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any, Dict, Optional, Tuple, List
+
+import pandas as pd
+
+from schema_discovery.quality.key_representations import build_key_representations, KeyRepConfig
+from schema_discovery.scoring.fk_score import name_similarity
+
+
+# =============================================================================
+# Config
+# =============================================================================
+@dataclass(frozen=True)
+class SoftIndConfig:
+    # -------------------------------------------------------------------------
+    # Accept thresholds (soft mode)
+    # -------------------------------------------------------------------------
+    min_distinct_coverage: float = 0.80
+    min_row_coverage: float = 0.80
+
+    # Alternative acceptance to reduce false negatives on optional / messy FKs
+    alt_min_distinct_coverage: float = 0.95
+    alt_min_row_coverage: float = 0.60
+    min_matched_rows: int = 200
+
+    # -------------------------------------------------------------------------
+    # General gating
+    # -------------------------------------------------------------------------
+    # Allow unary UCC columns to also be treated as FK candidates
+    allow_ucc_children: bool = True
+    min_non_null: int = 20
+
+    # Parent source control
+    parent_source: str = "ucc_plus_profile"  # "ucc_only" | "profile_keylike" | "ucc_plus_profile"
+
+    # Parent key-like gating when using profiles
+    min_parent_distinct: int = 10
+
+    # FK candidate gating (dynamic)
+    min_child_distinct: int = 10
+    # keep 0.00 if you want maximum recall, but expect more junk
+    min_child_unique_ratio: float = 0.00
+    max_child_null_ratio: float = 0.95
+
+    # PK sanity gating (UCC implies uniqueness, but exports can be messy)
+    # Only applies to UCC-derived parents, NOT profile-derived parents
+    min_parent_unique_ratio: float = 0.60
+    min_parent_non_null_ratio: float = 0.30
+
+    # -------------------------------------------------------------------------
+    # Candidate routing to avoid cartesian blow up
+    # -------------------------------------------------------------------------
+    enable_name_routing: bool = True
+    min_name_sim_for_routing: float = 0.20  # was 0.30
+    max_parents_per_fk: int = 20
+
+    # Fallback routing when naming is weak (prevents "0 pairs tested")
+    enable_fallback_routing: bool = True
+    fallback_parents_per_fk: int = 20
+
+    # -------------------------------------------------------------------------
+    # Guard against small-domain false positives
+    # -------------------------------------------------------------------------
+    small_domain_fk_distinct_max: int = 30
+    small_domain_min_name_sim: float = 0.65
+    # Only apply the small-domain guard when FK column looks categorical (dominated)
+    small_domain_top1_ratio_gate: float = 0.50
+
+    # -------------------------------------------------------------------------
+    # Key name hint (generic, dataset agnostic)
+    # -------------------------------------------------------------------------
+    key_name_hint_pattern: str = (
+        r"(?:^id$|id$|_id$|key$|_key$|code$|_code$|ref$|_ref$|seq$|_seq$|no$|_no$|num$|_num$|uuid$|guid$)"
+    )
+
+    # -------------------------------------------------------------------------
+    # Top1 dominance gate for columns (both children and profile-parents)
+    # -------------------------------------------------------------------------
+    top1_gate_distinct_max: int = 50
+    max_top1_ratio: float = 0.90
+
+    # -------------------------------------------------------------------------
+    # Placeholder handling for coverage
+    # -------------------------------------------------------------------------
+    placeholder_tokens: tuple[str, ...] = (
+        "0", "00", "000", "999", "9999", "999999",
+        "unknown", "UNKNOWN",
+        "null", "NULL",
+    )
+    placeholder_drop_top1_ratio: float = 0.75
+
+    # Representation config
+    rep_cfg: KeyRepConfig = field(default_factory=KeyRepConfig)
+
+
+# =============================================================================
+# Core coverage + range helpers
+# =============================================================================
+def _drop_dominant_placeholder(
+    child: pd.Series,
+    parent_set: set[str],
+    *,
+    max_top1_ratio: float,
+    placeholder_drop_top1_ratio: float,
+    placeholder_tokens: tuple[str, ...],
+) -> pd.Series:
+    """
+    If FK is dominated by one value, treat it as a placeholder and drop it
+    for coverage calculations.
+
+    We drop when:
+      1) top1_ratio >= placeholder_drop_top1_ratio AND top_val is a known placeholder token
+      OR
+      2) top1_ratio >= max_top1_ratio AND top_val is not in parent_set
+    """
+    c = child.dropna().astype("string")
+    if c.empty:
+        return c
+
+    vc = c.value_counts(dropna=True)
+    if vc.empty:
+        return c
+
+    top_val = str(vc.index[0])
+    top_ratio = float(vc.iloc[0]) / float(len(c))
+
+    norm_top = top_val.strip()
+    norm_low = norm_top.lower()
+    placeholder_low = {t.lower() for t in placeholder_tokens}
+
+    is_placeholder = (norm_top in placeholder_tokens) or (norm_low in placeholder_low)
+
+    if top_ratio >= float(placeholder_drop_top1_ratio) and is_placeholder:
+        return c[c != top_val]
+
+    if top_ratio >= float(max_top1_ratio) and top_val not in parent_set:
+        return c[c != top_val]
+
+    return c
+
+
+def _coverage(
+    child: pd.Series,
+    parent_set: set[str],
+    *,
+    max_top1_ratio: float,
+    placeholder_drop_top1_ratio: float,
+    placeholder_tokens: tuple[str, ...],
+) -> Tuple[float, float, int, int, int, int]:
+    """
+    Compute:
+      distinct_coverage = |distinct(child) ∩ parent| / |distinct(child)|
+      row_coverage      = matched_rows / non_null_rows
+
+    Returns:
+      distinct_cov, row_cov, matched_rows, fk_non_null_rows, fk_distinct, intersection_distinct
+    """
+    c = child.dropna().astype("string")
+    if c.empty or not parent_set:
+        return 0.0, 0.0, 0, int(len(c)), int(c.nunique(dropna=True)), 0
+
+    c = _drop_dominant_placeholder(
+        c,
+        parent_set,
+        max_top1_ratio=max_top1_ratio,
+        placeholder_drop_top1_ratio=placeholder_drop_top1_ratio,
+        placeholder_tokens=placeholder_tokens,
+    )
+    if c.empty:
+        return 0.0, 0.0, 0, 0, 0, 0
+
+    matched_mask = c.isin(parent_set)
+    matched_rows = int(matched_mask.sum())
+
+    fk_non_null_rows = int(len(c))
+    row_cov = matched_rows / float(fk_non_null_rows) if fk_non_null_rows else 0.0
+
+    fk_unique = pd.Index(c.unique())
+    fk_distinct = int(len(fk_unique))
+    if fk_distinct == 0:
+        return 0.0, row_cov, matched_rows, fk_non_null_rows, 0, 0
+
+    in_parent = fk_unique.isin(parent_set)
+    intersection_distinct = int(in_parent.sum())
+    distinct_cov = float(in_parent.mean())
+
+    return distinct_cov, row_cov, matched_rows, fk_non_null_rows, fk_distinct, intersection_distinct
+
+
+def _numeric_minmax(series: pd.Series) -> tuple[float | None, float | None]:
+    """
+    Best effort numeric min/max. Used only for range penalty in scoring.
+    If cannot be safely parsed -> (None, None).
+    """
+    s = series.dropna()
+    if s.empty:
+        return None, None
+
+    tok = s.astype("string").str.strip()
+    num = pd.to_numeric(tok, errors="coerce").dropna()
+    if num.empty:
+        return None, None
+
+    return float(num.min()), float(num.max())
+
+
+def best_representation_match(
+    fk_series: pd.Series,
+    pk_series: pd.Series,
+    cfg: SoftIndConfig,
+) -> Dict[str, Any]:
+    """
+    Try all FK x PK representation pairs, choose best by:
+      1) highest distinct_coverage
+      2) tie break -> highest row_coverage
+    """
+    fk_reps = build_key_representations(fk_series, other=pk_series, cfg=cfg.rep_cfg)
+    pk_reps = build_key_representations(pk_series, other=fk_series, cfg=cfg.rep_cfg)
+
+    # Cache parent sets and distinct counts per PK rep
+    pk_sets: Dict[str, set[str]] = {}
+    pk_distincts: Dict[str, int] = {}
+    for pk_name, pk_r in pk_reps.items():
+        pv = pk_r.dropna().astype("string")
+        s = set(pv.unique())
+        pk_sets[pk_name] = s
+        pk_distincts[pk_name] = int(len(s))
+
+    best: Dict[str, Any] = {
+        "fk_rep": None,
+        "pk_rep": None,
+        "distinct_coverage": 0.0,
+        "row_coverage": 0.0,
+        "matched_rows": 0,
+        "fk_non_null_rows": 0,
+        "fk_distinct": 0,
+        "intersection_distinct": 0,
+        "pk_distinct": 0,
+    }
+
+    for fk_name, fk_r in fk_reps.items():
+        fk_nn = int(fk_r.notna().sum())
+        if fk_nn == 0:
+            continue
+
+        for pk_name, parent_set in pk_sets.items():
+            if not parent_set:
+                continue
+
+            dc, rc, mr, fk_nnz, fk_dist, inter = _coverage(
+                fk_r,
+                parent_set,
+                max_top1_ratio=cfg.max_top1_ratio,
+                placeholder_drop_top1_ratio=cfg.placeholder_drop_top1_ratio,
+                placeholder_tokens=cfg.placeholder_tokens,
+            )
+
+            if (dc > best["distinct_coverage"]) or (dc == best["distinct_coverage"] and rc > best["row_coverage"]):
+                best = {
+                    "fk_rep": fk_name,
+                    "pk_rep": pk_name,
+                    "distinct_coverage": float(dc),
+                    "row_coverage": float(rc),
+                    "matched_rows": int(mr),
+                    "fk_non_null_rows": int(fk_nnz),
+                    "fk_distinct": int(fk_dist),
+                    "intersection_distinct": int(inter),
+                    "pk_distinct": int(pk_distincts.get(pk_name, 0)),
+                }
+
+    return best
+
+
+# =============================================================================
+# Candidate selection
+# =============================================================================
+def _build_parent_candidates(
+    ucc_df: pd.DataFrame,
+    profiles_df: pd.DataFrame,
+    cfg: SoftIndConfig,
+) -> pd.DataFrame:
+    """
+    Parents from unary UCCs + sanity gating using profiles.
+    """
+    if ucc_df is None or ucc_df.empty:
+        return pd.DataFrame(columns=["table_name", "column_name"])
+
+    if "is_unary_ucc" in ucc_df.columns:
+        parents = ucc_df.loc[ucc_df["is_unary_ucc"] == True, ["table_name", "column_name"]].drop_duplicates()  # noqa: E712
+    else:
+        parents = ucc_df.loc[:, ["table_name", "column_name"]].drop_duplicates()
+
+    if profiles_df is None or profiles_df.empty:
+        return parents
+
+    need = {"table_name", "column_name", "unique_ratio", "null_ratio", "n_rows"}
+    if not need.issubset(set(profiles_df.columns)):
+        return parents
+
+    parents = parents.merge(
+        profiles_df[list(need)],
+        on=["table_name", "column_name"],
+        how="left",
+    )
+
+    parents = parents.loc[
+        (parents["n_rows"] >= cfg.min_non_null)
+        & ((1.0 - parents["null_ratio"]) >= cfg.min_parent_non_null_ratio)
+        & (parents["unique_ratio"] >= cfg.min_parent_unique_ratio),
+        ["table_name", "column_name"],
+    ].drop_duplicates()
+
+    return parents
+
+
+def _build_parent_candidates_from_profiles(profiles_df: pd.DataFrame, cfg: SoftIndConfig) -> pd.DataFrame:
+    """
+    Additional parents from profiling for messy exports where "true parent"
+    columns might not be unique.
+    """
+    if profiles_df is None or profiles_df.empty:
+        return pd.DataFrame(columns=["table_name", "column_name"])
+
+    required = {"table_name", "column_name", "n_rows", "n_unique", "null_ratio", "top1_ratio"}
+    missing = required - set(profiles_df.columns)
+    if missing:
+        raise ValueError(f"profiles_df missing required columns for soft IND parents: {sorted(missing)}")
+
+    name_hint = profiles_df["column_name"].astype(str).str.contains(
+        cfg.key_name_hint_pattern, case=False, regex=True
+    )
+
+    cand = profiles_df.loc[
+        (profiles_df["n_rows"] >= cfg.min_non_null)
+        & ((1.0 - profiles_df["null_ratio"]) >= cfg.min_parent_non_null_ratio)
+        & (profiles_df["n_unique"] >= cfg.min_parent_distinct)
+        & (name_hint),
+        ["table_name", "column_name", "n_unique", "top1_ratio"],
+    ].drop_duplicates()
+
+    # Gate out categorical parents dominated by 1 value (only for small distinct)
+    low_distinct = cand["n_unique"].astype(float) <= float(cfg.top1_gate_distinct_max)
+    dominated = cand["top1_ratio"].astype(float) > float(cfg.max_top1_ratio)
+    cand = cand[~(low_distinct & dominated)].copy()
+
+    return cand[["table_name", "column_name"]].drop_duplicates()
+
+
+def _build_child_candidates(
+    profiles_df: pd.DataFrame,
+    ucc_df: pd.DataFrame,
+    cfg: SoftIndConfig,
+) -> pd.DataFrame:
+    """
+    Children are FK-like columns from profiling.
+    Excludes unary UCC columns to avoid reversed edges.
+    """
+    if profiles_df is None or profiles_df.empty:
+        return pd.DataFrame(columns=["table_name", "column_name"])
+
+    required = {"table_name", "column_name", "n_rows", "n_unique", "unique_ratio", "null_ratio", "top1_ratio"}
+    missing = required - set(profiles_df.columns)
+    if missing:
+        raise ValueError(f"profiles_df missing required columns for soft IND: {sorted(missing)}")
+
+    name_hint = profiles_df["column_name"].astype(str).str.contains(
+        cfg.key_name_hint_pattern, case=False, regex=True
+    )
+
+    cand = profiles_df.loc[
+        (profiles_df["n_rows"] >= cfg.min_non_null)
+        & (profiles_df["null_ratio"] <= cfg.max_child_null_ratio)
+        & (profiles_df["n_unique"] >= cfg.min_child_distinct)
+        & (profiles_df["unique_ratio"] >= cfg.min_child_unique_ratio)
+        & (name_hint),
+        ["table_name", "column_name", "n_unique", "top1_ratio"],
+    ].drop_duplicates()
+
+    # Top1 dominance gate (small-domain + dominated)
+    low_distinct = cand["n_unique"].astype(float) <= float(cfg.top1_gate_distinct_max)
+    dominated = cand["top1_ratio"].astype(float) > float(cfg.max_top1_ratio)
+    cand = cand[~(low_distinct & dominated)].copy()
+
+    
+    if (not cfg.allow_ucc_children) and (ucc_df is not None and not ucc_df.empty):
+        ucc_pairs = set(zip(ucc_df["table_name"].astype(str), ucc_df["column_name"].astype(str)))
+        cand_pairs = list(zip(cand["table_name"].astype(str), cand["column_name"].astype(str)))
+        keep_mask = [p not in ucc_pairs for p in cand_pairs]
+        cand = cand.loc[keep_mask].copy()
+
+    return cand[["table_name", "column_name"]].drop_duplicates()
+
+
+def _route_pairs(
+    children: pd.DataFrame,
+    parents: pd.DataFrame,
+    cfg: SoftIndConfig,
+) -> List[tuple[str, str, str, str, float]]:
+    """
+    Route FK candidates to a small set of PK candidates using name similarity.
+    Returns list of (fk_table, fk_col, pk_table, pk_col, name_sim).
+    """
+    if children.empty or parents.empty:
+        return []
+
+    child_rows = [(r.table_name, r.column_name) for r in children.itertuples(index=False)]
+    parent_rows = [(r.table_name, r.column_name) for r in parents.itertuples(index=False)]
+
+    pairs: List[tuple[str, str, str, str, float]] = []
+
+    if not cfg.enable_name_routing:
+        for fk_t, fk_c in child_rows:
+            for pk_t, pk_c in parent_rows:
+                if fk_t != pk_t:
+                    pairs.append((fk_t, fk_c, pk_t, pk_c, 0.0))
+        return pairs
+
+    for fk_t, fk_c in child_rows:
+        scored: List[tuple[str, str, float]] = []
+        for pk_t, pk_c in parent_rows:
+            if fk_t == pk_t:
+                continue
+            sim = float(name_similarity(fk_c, pk_c))
+            if sim >= float(cfg.min_name_sim_for_routing):
+                scored.append((pk_t, pk_c, sim))
+
+        if scored:
+            scored.sort(key=lambda x: x[2], reverse=True)
+            for pk_t, pk_c, sim in scored[: int(cfg.max_parents_per_fk)]:
+                pairs.append((fk_t, fk_c, pk_t, pk_c, sim))
+            continue
+
+        # Fallback: if routing produced nothing, still test a limited set of parents
+        if cfg.enable_fallback_routing:
+            def _table_affinity(pk_t: str) -> int:
+                return 1 if str(pk_t).lower().startswith(str(fk_t).lower()[:3]) else 0
+
+            fallback = [(pk_t, pk_c) for pk_t, pk_c in parent_rows if pk_t != fk_t]
+            fallback.sort(key=lambda x: _table_affinity(x[0]), reverse=True)
+
+            for pk_t, pk_c in fallback[: int(cfg.fallback_parents_per_fk)]:
+                pairs.append((fk_t, fk_c, pk_t, pk_c, 0.0))
+
+    return pairs
+
+
+# =============================================================================
+# Public API
+# =============================================================================
+def discover_ind_unary_soft_all_pairs(
+    *,
+    dfs: Dict[str, pd.DataFrame],
+    profiles_df: pd.DataFrame,
+    ucc_df: pd.DataFrame,
+    cfg: Optional[SoftIndConfig] = None,
+    reject_log_path: Optional[str] = None,
+) -> pd.DataFrame:
+    """
+    Soft IND discovery (routed pairs + representation matching).
+
+    Output schema matches fk_score.required columns, so strict and soft
+    can share the same scoring + selection.
+
+    If reject_log_path is provided, writes a CSV of rejected routed pairs with reasons.
+    """
+    cfg = cfg or SoftIndConfig()
+
+    if cfg.parent_source == "profile_keylike":
+        parents = _build_parent_candidates_from_profiles(profiles_df, cfg)
+    elif cfg.parent_source == "ucc_plus_profile":
+        p1 = _build_parent_candidates(ucc_df, profiles_df, cfg)
+        p2 = _build_parent_candidates_from_profiles(profiles_df, cfg)
+        parents = pd.concat([p1, p2], ignore_index=True).drop_duplicates()
+    else:
+        parents = _build_parent_candidates(ucc_df, profiles_df, cfg)
+
+    children = _build_child_candidates(profiles_df, ucc_df, cfg)
+    cand_pairs = _route_pairs(children, parents, cfg)
+
+    out_cols = [
+        "fk_table", "fk_column", "pk_table", "pk_column",
+        "distinct_coverage", "row_coverage",
+        "fk_distinct", "pk_distinct", "intersection_distinct",
+        "fk_min", "fk_max", "pk_min", "pk_max",
+        "matched_rows", "fk_non_null_rows",
+        "fk_rep", "pk_rep",
+        "mode",
+    ]
+
+    if not cand_pairs:
+        return pd.DataFrame(columns=out_cols)
+
+    out_rows: list[dict[str, Any]] = []
+    reject_rows: list[dict[str, Any]] = []
+
+    def _reject(fk_t: str, fk_c: str, pk_t: str, pk_c: str, ns: float, reason: str) -> None:
+        reject_rows.append(
+            {
+                "fk_table": fk_t,
+                "fk_column": fk_c,
+                "pk_table": pk_t,
+                "pk_column": pk_c,
+                "name_sim": float(ns),
+                "reason": str(reason),
+            }
+        )
+
+    for fk_table, fk_col, pk_table, pk_col, ns in cand_pairs:
+        if fk_table not in dfs or pk_table not in dfs:
+            _reject(fk_table, fk_col, pk_table, pk_col, ns, "table_missing")
+            continue
+        if fk_col not in dfs[fk_table].columns or pk_col not in dfs[pk_table].columns:
+            _reject(fk_table, fk_col, pk_table, pk_col, ns, "column_missing")
+            continue
+
+        fk_s = dfs[fk_table][fk_col]
+        pk_s = dfs[pk_table][pk_col]
+
+        def _effective_non_null(s: pd.Series) -> int:
+            x = s.astype("string").str.strip()
+            x = x.where(x.str.len() > 0)
+            return int(x.notna().sum())
+
+        fk_eff = _effective_non_null(fk_s)
+        pk_eff = _effective_non_null(pk_s)
+
+        if fk_eff < int(cfg.min_non_null) or pk_eff < int(cfg.min_non_null):
+            _reject(fk_table, fk_col, pk_table, pk_col, ns, "min_non_null_effective")
+            continue
+
+        best = best_representation_match(fk_s, pk_s, cfg)
+
+        if best["fk_rep"] is None or best["pk_rep"] is None:
+            _reject(
+                fk_table, fk_col, pk_table, pk_col, ns,
+                f"no_representation_match fk_eff={fk_eff} pk_eff={pk_eff}"
+            )
+            continue
+
+        # Small-domain guard: only reject if column behaves categorical (dominated) AND naming is weak
+        if int(best["fk_distinct"]) <= int(cfg.small_domain_fk_distinct_max):
+            fk_reps_tmp = build_key_representations(fk_s, other=pk_s, cfg=cfg.rep_cfg)
+            fk_tmp = fk_reps_tmp.get(best["fk_rep"], fk_s).dropna().astype("string")
+
+            top1_ratio = 0.0
+            if len(fk_tmp):
+                vc = fk_tmp.value_counts(dropna=True)
+                if not vc.empty:
+                    top1_ratio = float(vc.iloc[0]) / float(len(fk_tmp))
+
+            if top1_ratio >= float(cfg.small_domain_top1_ratio_gate) and float(ns) < float(cfg.small_domain_min_name_sim):
+                _reject(fk_table, fk_col, pk_table, pk_col, ns, "small_domain_guard")
+                continue
+
+        # Coverage acceptance (primary + alternative rules)
+        dc = float(best["distinct_coverage"])
+        rc = float(best["row_coverage"])
+        mr = int(best["matched_rows"])
+
+        accept = False
+
+        # Primary
+        if dc >= float(cfg.min_distinct_coverage) and rc >= float(cfg.min_row_coverage):
+            accept = True
+
+        # Alt 1: very strong distinct evidence, allow lower row coverage
+        if (not accept) and dc >= float(cfg.alt_min_distinct_coverage) and rc >= float(cfg.alt_min_row_coverage):
+            accept = True
+
+        # Alt 2: many matched rows, even if row coverage is depressed by optionality
+        if (not accept) and dc >= float(cfg.min_distinct_coverage) and mr >= int(cfg.min_matched_rows):
+            accept = True
+
+        if not accept:
+            _reject(fk_table, fk_col, pk_table, pk_col, ns, "coverage_fail")
+            continue
+
+        # Compute numeric ranges from winning representations (for range penalty)
+        fk_reps = build_key_representations(fk_s, other=pk_s, cfg=cfg.rep_cfg)
+        pk_reps = build_key_representations(pk_s, other=fk_s, cfg=cfg.rep_cfg)
+
+        fk_best_s = fk_reps.get(best["fk_rep"], fk_s)
+        pk_best_s = pk_reps.get(best["pk_rep"], pk_s)
+
+        fk_min, fk_max = _numeric_minmax(fk_best_s)
+        pk_min, pk_max = _numeric_minmax(pk_best_s)
+
+        out_rows.append(
+            {
+                "fk_table": fk_table,
+                "fk_column": fk_col,
+                "pk_table": pk_table,
+                "pk_column": pk_col,
+                "distinct_coverage": float(best["distinct_coverage"]),
+                "row_coverage": float(best["row_coverage"]),
+                "fk_distinct": int(best["fk_distinct"]),
+                "pk_distinct": int(best["pk_distinct"]),
+                "intersection_distinct": int(best["intersection_distinct"]),
+                "fk_min": fk_min,
+                "fk_max": fk_max,
+                "pk_min": pk_min,
+                "pk_max": pk_max,
+                "matched_rows": int(best["matched_rows"]),
+                "fk_non_null_rows": int(best["fk_non_null_rows"]),
+                "fk_rep": str(best["fk_rep"]),
+                "pk_rep": str(best["pk_rep"]),
+                "mode": "soft",
+            }
+        )
+
+    # Optional reject log
+    if reject_log_path is not None:
+        try:
+            pd.DataFrame(reject_rows).to_csv(reject_log_path, index=False)
+        except Exception:
+            pass
+
+    if not out_rows:
+        return pd.DataFrame(columns=out_cols)
+
+    return pd.DataFrame(out_rows)[out_cols]
+
+================================================================================
+
+schema_discovery/candidates/ind_unary.py:
+
+"""
+Unary IND discovery.
+
+IND = Inclusion Dependency: values in column A are included in column B (A ⊆ B).
+Unary means one column on each side.
+
+This module generates candidate cross-table links by testing child columns
+against candidate unique columns (UCCs) from other tables.
+
+Output is not just True or False. It returns coverage metrics so later stages
+can score and select the most plausible relationships.
+
+Recent changes:
+
+Parent key domains are computed once and cached. This is the big speedup.
+Removed per row apply on profiles_df for excluding UCCs.
+Added matched_rows because it helps interpret row coverage.
+Output schema is consistent even when empty.
+"""
+
+from __future__ import annotations
+
+import pandas as pd
+import numpy as np 
+
+from schema_discovery.quality.key_normalisation import norm_key_series
+
+
+def discover_ind_unary(
+    dfs: dict[str, pd.DataFrame],
+    ucc_df: pd.DataFrame,
+    profiles_df: pd.DataFrame,
+    min_distinct_child: int = 20,
+    min_non_null_rows: int = 20,
+    min_distinct_coverage: float = 0.90,
+    dtype_families: tuple[str, ...] = ("int","string"),
+    min_fk_unique_ratio_non_null: float = 0.02,
+    top1_gate_distinct_max: int = 50,
+    max_top1_ratio: float = 0.90,
+    min_string_distinct_child: int = 20,
+    max_string_len_spread: int = 30,
+    max_string_avg_len: float = 40.0,
+    max_pk_distinct_cache: int = 2_000_000,
+) -> pd.DataFrame:
+    
+    required_ucc = {"table_name", "column_name", "dtype_family"}
+    missing_ucc = required_ucc - set(ucc_df.columns)
+    if missing_ucc:
+        raise ValueError(f"ucc_df missing required columns: {sorted(missing_ucc)}")
+
+    required_prof = {
+        "table_name", "column_name", "dtype_family",
+        "null_ratio", "n_rows", "n_unique", "unique_ratio",
+        "unique_ratio_non_null",
+        "top1_ratio",
+        "avg_len", "min_len", "max_len",
+    }
+    missing_prof = required_prof - set(profiles_df.columns)
+    if missing_prof:
+        raise ValueError(f"profiles_df missing required columns: {sorted(missing_prof)}")
+
+    base_cols = [
+        "fk_table", "fk_column", "pk_table", "pk_column",
+        "fk_dtype_family", "pk_dtype_family",
+        "fk_non_null_rows", "fk_distinct",
+        "pk_distinct", "intersection_distinct",
+        "distinct_coverage", "row_coverage",
+        "matched_rows",
+        "fk_min", "fk_max", "pk_min", "pk_max",
+    ]
+
+    # -----------------------------
+    # 1) Build parent candidates list (UCCs) and precompute their domains
+    # -----------------------------
+    parent = ucc_df.copy()
+    parent = parent[parent["dtype_family"].isin(dtype_families)].copy()
+
+    parent_rows = []
+    for pk_table, pk_col, pk_dtype in parent[["table_name", "column_name", "dtype_family"]].itertuples(index=False):
+        if pk_table not in dfs or pk_col not in dfs[pk_table].columns:
+            continue
+        parent_rows.append((pk_table, pk_col, pk_dtype))
+    parent = pd.DataFrame(parent_rows, columns=["pk_table", "pk_column", "pk_dtype_family"])
+
+    if parent.empty:
+        return pd.DataFrame(columns=base_cols)
+
+    def _minmax_if_int(s: pd.Series, dtype_family: str):
+        if dtype_family != "int" or s.empty:
+            return None, None
+        x = pd.to_numeric(pd.Series(s, dtype="object"), errors="coerce").dropna()
+        if x.empty:
+            return None, None
+        return int(x.min()), int(x.max())
+    
+    def _hash_u64(s: pd.Series) -> pd.Series:
+        """
+        Return stable uint64 hashes for values in s (object/string/int all supported).
+        Uses pandas hashing (fast, vectorised).
+        """
+        return pd.util.hash_pandas_object(pd.Series(s, dtype="object"), index=False).astype("uint64")
+
+
+    # Precompute parent sets once: pk_set, pk_distinct, min, max
+    parent_cache: dict[tuple[str, str], dict[str, object]] = {}
+    for pk_table, pk_col, pk_dtype in parent.itertuples(index=False):
+        s_pk = norm_key_series(dfs[pk_table][pk_col])
+        if s_pk.empty:
+            continue
+
+        pk_hash = _hash_u64(s_pk)
+        pk_hash_distinct = pk_hash.drop_duplicates()
+
+        pk_hset = set(pk_hash_distinct.tolist())
+        if not pk_hset:
+            continue
+
+        # optional safety cap
+        if len(pk_hset) > int(max_pk_distinct_cache):
+            continue
+
+        pk_min, pk_max = _minmax_if_int(s_pk, pk_dtype)
+
+        parent_cache[(pk_table, pk_col)] = {
+            "pk_dtype_family": pk_dtype,
+            "pk_hset": pk_hset,
+            "pk_distinct": int(len(pk_hset)),
+            "pk_min": pk_min,
+            "pk_max": pk_max,
+        }
+
+
+    if not parent_cache:
+        return pd.DataFrame(columns=base_cols)
+
+    # -----------------------------
+    # 2) Choose child columns to test (non-UCC columns, compatible dtype)
+    # -----------------------------
+    # Build a fast lookup of UCC columns so we do not test them as children
+    ucc_keys = set(zip(ucc_df["table_name"].astype(str), ucc_df["column_name"].astype(str)))
+
+    child = profiles_df.copy()
+    child = child[child["dtype_family"].isin(dtype_families)].copy()
+
+    # vectorised filter: exclude UCC columns
+    child_keys = list(zip(child["table_name"].astype(str), child["column_name"].astype(str)))
+    child = child[[k not in ucc_keys for k in child_keys]].copy()
+
+    # cheap pruning: skip extremely sparse columns
+    child = child[child["null_ratio"] < 0.95].copy()
+
+    # ---------------------------------
+    # NEW: FK-likeness gates
+    # ---------------------------------
+
+    # Gate 1: minimum non-null uniqueness among non-null rows
+    child = child[child["unique_ratio_non_null"] >= float(min_fk_unique_ratio_non_null)].copy()
+
+    # Gate 2: top1 dominance gate, only applied to low-distinct columns
+    # If a column has few distinct values and one value dominates, it is almost never an FK.
+    low_distinct = child["n_unique"].astype(float) <= float(top1_gate_distinct_max)
+    dominated = child["top1_ratio"].astype(float) > float(max_top1_ratio)
+    child = child[~(low_distinct & dominated)].copy()
+
+    is_string = child["dtype_family"].astype(str) == "string"
+
+    # enough distinct values for string FKs
+    child = child[~is_string | (child["n_unique"].astype(float) >= float(min_string_distinct_child))].copy()
+
+    # block free-text by length behaviour
+    len_spread = (child["max_len"].astype(float) - child["min_len"].astype(float)).fillna(0.0)
+    avg_len = child["avg_len"].astype(float).fillna(0.0)
+
+    child = child[
+        ~is_string
+        | (
+            (len_spread <= float(max_string_len_spread))
+            & (avg_len <= float(max_string_avg_len))
+        )
+    ].copy()
+
+    # only keep columns that exist in dfs
+    child_rows = []
+    for fk_table, fk_col, fk_dtype in child[["table_name", "column_name", "dtype_family"]].itertuples(index=False):
+        if fk_table not in dfs or fk_col not in dfs[fk_table].columns:
+            continue
+        child_rows.append((fk_table, fk_col, fk_dtype))
+    child = pd.DataFrame(child_rows, columns=["fk_table", "fk_column", "fk_dtype_family"])
+
+    if child.empty:
+        return pd.DataFrame(columns=base_cols)
+
+    # -----------------------------
+    # 3) Test inclusion (distinct coverage + row coverage)
+    # -----------------------------
+    edges = []
+
+    for fk_table, fk_col, fk_dtype in child.itertuples(index=False):
+        s_fk = norm_key_series(dfs[fk_table][fk_col])
+        fk_non_null = int(len(s_fk))
+        if fk_non_null < min_non_null_rows:
+            continue
+
+        fk_hash = _hash_u64(s_fk)
+
+        fk_hash_distinct = fk_hash.drop_duplicates()
+        fk_distinct = int(len(fk_hash_distinct))
+
+        min_dist = min_distinct_child if fk_dtype != "string" else min_string_distinct_child
+        if fk_distinct < int(min_dist):
+            continue
+
+        fk_hset = set(fk_hash_distinct.tolist())
+        if not fk_hset:
+            continue
+
+
+        fk_min, fk_max = _minmax_if_int(s_fk, fk_dtype)
+
+        for (pk_table, pk_col), pk_info in parent_cache.items():
+            if pk_table == fk_table:
+                continue
+
+            pk_dtype = pk_info["pk_dtype_family"]
+            if pk_dtype != fk_dtype:
+                continue
+
+            pk_hset = pk_info["pk_hset"]
+            pk_distinct = int(pk_info["pk_distinct"])
+
+            inter = fk_hset.intersection(pk_hset)
+            intersection_distinct = int(len(inter))
+            distinct_coverage = intersection_distinct / fk_distinct if fk_distinct else 0.0
+            if distinct_coverage < min_distinct_coverage:
+                continue
+
+            matched_rows = int(fk_hash.isin(pk_hset).sum())
+            row_coverage = matched_rows / fk_non_null if fk_non_null else 0.0
+
+            edges.append(
+                {
+                    "fk_table": fk_table,
+                    "fk_column": fk_col,
+                    "pk_table": pk_table,
+                    "pk_column": pk_col,
+                    "fk_dtype_family": fk_dtype,
+                    "pk_dtype_family": pk_dtype,
+                    "fk_non_null_rows": fk_non_null,
+                    "fk_distinct": fk_distinct,
+                    "pk_distinct": pk_distinct,
+                    "fk_min": fk_min,
+                    "fk_max": fk_max,
+                    "pk_min": pk_info["pk_min"],
+                    "pk_max": pk_info["pk_max"],
+                    "intersection_distinct": intersection_distinct,
+                    "distinct_coverage": round(distinct_coverage, 6),
+                    "row_coverage": round(row_coverage, 6),
+                    "matched_rows": matched_rows,
+                }
+            )
+
+    out = pd.DataFrame(edges)
+    if out.empty:
+        return pd.DataFrame(columns=base_cols)
+
+    # Sort best evidence first for readability
+    out = out.sort_values(
+        by=["distinct_coverage", "row_coverage", "fk_non_null_rows", "fk_distinct"],
+        ascending=[False, False, False, False],
+        kind="mergesort",
+    ).reset_index(drop=True)
+
+    return out
+
+
+================================================================================
+
+schema_discovery/candidates/ucc_unary.py:
+
+"""
+Unary UCC discovery.
+
+UCC = Unique Column Combination.
+Unary: a single column is unique (and typically non-null).
+
+This module extracts unary UCC candidates from the profiling output.
+These candidates are later used as possible referenced keys when searching
+for relationships (INDs) between tables.
+
+This module does not choose a primary key. It only returns candidates.
+"""
+
+from __future__ import annotations
+
+import pandas as pd
+
+
+def discover_ucc_unary(
+    profiles_df: pd.DataFrame,
+    unique_ratio_min: float = 1.0,
+    null_ratio_max: float = 0.0,
+    use_flag_if_present: bool = True,
+) -> pd.DataFrame:
+    """
+    Return unary UCC candidates from a profiles DataFrame.
+
+    A column is considered a unary UCC candidate if:
+      - unique_ratio >= unique_ratio_min
+      - null_ratio   <= null_ratio_max
+ 
+    If profiling provides `is_unary_ucc` and use_flag_if_present=True,
+    that flag is used as an additional fast path signal.
+    """
+    required = {
+        "table_name",
+        "column_name",
+        "dtype_family",
+        "n_rows",
+        "unique_ratio",
+        "null_ratio",
+    }
+    missing = required - set(profiles_df.columns)
+    if missing:
+        raise ValueError(f"profiles_df missing required columns: {sorted(missing)}")
+
+    df = profiles_df.copy()
+
+    mask = (df["unique_ratio"] >= unique_ratio_min) & (df["null_ratio"] <= null_ratio_max)
+
+    if use_flag_if_present and "is_unary_ucc" in df.columns:
+        # If strict mode is requested, the flag is consistent with strict thresholds.
+        # If relaxed thresholds are used, we still keep the ratio-based rule.
+        mask = mask | (df["is_unary_ucc"].astype(bool))
+
+    ucc = df.loc[mask, ["table_name", "column_name", "dtype_family", "n_rows", "unique_ratio", "null_ratio"]].copy()
+    ucc["ucc_type"] = "unary"
+
+    return ucc.sort_values(["table_name", "column_name"], kind="mergesort").reset_index(drop=True)
+
+
+================================================================================
+
+schema_discovery/pipeline/run.py:
+
+# schema_discovery/pipeline/run.py
+
+from __future__ import annotations
+
+from dataclasses import dataclass, replace
+from typing import Optional, Any, Literal
+
+import pandas as pd
+
+from schema_discovery.profiling.profiler import profile_all_tables
+from schema_discovery.candidates.ucc_unary import discover_ucc_unary
+
+# IND strict + soft
+from schema_discovery.candidates.ind_unary import discover_ind_unary
+from schema_discovery.candidates.ind_unary_soft import (
+    discover_ind_unary_soft_all_pairs,
+    SoftIndConfig,
+)
+
+from schema_discovery.scoring.fk_score import score_ind_candidates
+from schema_discovery.selection.select_edges import select_best_edges
+
+from schema_discovery.quality.relational_missing import (
+    RelMissingConfig,
+    run_rel_missing_for_edge,
+    rel_missing_summary_to_df,
+)
+
+from schema_discovery.quality.duplicates import (
+    DuplicateChecksConfig,
+    run_duplicate_checks,
+)
+
+from schema_discovery.quality.default_fk import (
+    DefaultFKConfig,
+    run_default_fk_for_edges,
+    default_fk_summary_to_df,
+)
+
+from schema_discovery.annotation.surrogate_keys import (
+    SurrogateKeyConfig,
+    annotate_surrogate_keys,
+)
+
+from schema_discovery.candidates.ucc_composite import (
+    CompositeUCCConfig,
+    discover_ucc_composite,
+)
+
+from schema_discovery.recommendation import build_schema_recommendations
+
+
+ProfileMode = Literal["basic", "enhanced"]
+IndMode = Literal["strict", "soft"]
+
+
+@dataclass
+class PipelineConfig:
+    # profiling
+    sample_k: int = 5
+    profile_mode: ProfileMode = "basic"  # basic | enhanced
+
+    # UCC (unary)
+    ucc_unique_ratio_min: float = 1.0
+    ucc_null_ratio_max: float = 0.0
+
+    # IND mode switch
+    ind_mode: IndMode = "strict"
+
+    # Shared IND gating
+    ind_min_non_null_rows: int = 20
+
+    # Strict IND inputs
+    ind_min_distinct_child: int = 10
+    ind_min_distinct_coverage: float = 0.90
+    ind_dtype_families: tuple[str, ...] = ("int", "string")
+
+    # Soft IND thresholds
+    soft_ind_min_distinct_coverage: float = 0.80
+    soft_ind_min_row_coverage: float = 0.80
+
+    # Soft IND routing controls (avoid cartesian blow up)
+    soft_ind_min_name_sim_for_routing: float = 0.30
+    soft_ind_max_parents_per_fk: int = 20
+
+    # Soft IND false positive controls
+    soft_ind_small_domain_fk_distinct_max: int = 30
+    soft_ind_small_domain_min_name_sim: float = 0.65
+
+    # scoring
+    w_distinct: float = 0.75
+    w_row: float = 0.20
+    w_name: float = 0.05
+    w_range_penalty: float = 0.10
+    fk_distinct_small_max: int = 2000
+
+    # selection
+    min_edge_score: float = 0.90
+
+    # relational missingness
+    rel_missing_enabled: bool = False
+    rel_missing_sample_n: int = 10
+    rel_orphan_warn_ratio: float = 0.01
+    rel_orphan_fail_ratio: float = 0.05
+    rel_missing_warn_ratio: float = 0.05
+    rel_missing_fail_ratio: float = 0.20
+
+    # duplicates
+    duplicates_enabled: bool = False
+
+    # default fk detection
+    default_fk_enabled: bool = False
+    default_fk_sample_n: int = 5
+    default_fk_cfg: Optional[DefaultFKConfig] = None
+
+    # duplicates config inputs
+    duplicate_subset_keys: Optional[dict[str, list[list[str]]]] = None
+    duplicate_relationship_tables: Optional[dict[str, dict[str, str]]] = None
+
+    # surrogate key detection
+    surrogate_keys_enabled: bool = False
+    surrogate_keys_cfg: Optional[SurrogateKeyConfig] = None
+
+    # composite ucc detection
+    composite_ucc_enabled: bool = False
+    composite_ucc_max_k: int = 3
+    composite_ucc_max_cols_per_table: int = 12
+
+
+def run_schema_discovery(
+    dfs: dict[str, pd.DataFrame],
+    config: Optional[PipelineConfig] = None,
+    include_stages: Optional[list[str]] = None,
+) -> dict[str, Any]:
+    cfg_in = config or PipelineConfig()
+    include = set(include_stages or [])
+
+    # Do not mutate the caller's config object.
+    # If recommendations requested, force the dependency computations on this run only.
+    if "recommendations" in include:
+        cfg = replace(
+            cfg_in,
+            rel_missing_enabled=True,
+            duplicates_enabled=True,
+            default_fk_enabled=True,
+            surrogate_keys_enabled=True,
+            composite_ucc_enabled=True,
+        )
+    else:
+        cfg = cfg_in
+
+    # 1) profiling
+    mode: ProfileMode = cfg.profile_mode if cfg.profile_mode in ("basic", "enhanced") else "basic"
+    profiles_df, profile_extras = profile_all_tables(dfs, sample_k=cfg.sample_k, mode=mode)
+
+    # 2) UCC (unary)
+    ucc_df = discover_ucc_unary(
+        profiles_df,
+        unique_ratio_min=cfg.ucc_unique_ratio_min,
+        null_ratio_max=cfg.ucc_null_ratio_max,
+    )
+
+    # 3) IND (strict OR soft, never both)
+    
+    if cfg.ind_mode == "soft":
+        soft_cfg = SoftIndConfig(
+            parent_source="ucc_plus_profile",
+            min_distinct_coverage=cfg.soft_ind_min_distinct_coverage,
+            min_row_coverage=cfg.soft_ind_min_row_coverage,
+            min_non_null=cfg.ind_min_non_null_rows,
+            min_name_sim_for_routing=cfg.soft_ind_min_name_sim_for_routing,
+            max_parents_per_fk=cfg.soft_ind_max_parents_per_fk,
+            small_domain_fk_distinct_max=cfg.soft_ind_small_domain_fk_distinct_max,
+            small_domain_min_name_sim=cfg.soft_ind_small_domain_min_name_sim,
+            allow_ucc_children=True,  
+        )
+        ind_df = discover_ind_unary_soft_all_pairs(
+            dfs=dfs,
+            profiles_df=profiles_df,
+            ucc_df=ucc_df,
+            cfg=soft_cfg,
+        )
+    else:
+        ind_df = discover_ind_unary(
+            dfs=dfs,
+            ucc_df=ucc_df,
+            profiles_df=profiles_df,
+            min_distinct_child=cfg.ind_min_distinct_child,
+            min_non_null_rows=cfg.ind_min_non_null_rows,
+            min_distinct_coverage=cfg.ind_min_distinct_coverage,
+            dtype_families=cfg.ind_dtype_families,
+        )
+
+    # 4) scoring
+    scored_df = (
+        score_ind_candidates(
+            ind_df,
+            w_distinct=cfg.w_distinct,
+            w_row=cfg.w_row,
+            w_name=cfg.w_name,
+            w_range_penalty=cfg.w_range_penalty,
+            fk_distinct_small_max=cfg.fk_distinct_small_max,
+        )
+        if (ind_df is not None and not ind_df.empty)
+        else (ind_df.copy() if ind_df is not None else pd.DataFrame())
+    )
+
+    # 5) selection
+    edges_df = (
+        select_best_edges(scored_df, profiles_df=profiles_df, min_score=cfg.min_edge_score)
+        if (scored_df is not None and not scored_df.empty)
+        else (scored_df.copy() if scored_df is not None else pd.DataFrame())
+    )
+
+    # 6) relational missingness (optional)
+    rel_missing_df = pd.DataFrame()
+    if cfg.rel_missing_enabled and (edges_df is not None and not edges_df.empty):
+        cfg_rm = RelMissingConfig(
+            orphan_warn_ratio=cfg.rel_orphan_warn_ratio,
+            orphan_fail_ratio=cfg.rel_orphan_fail_ratio,
+            missing_warn_ratio=cfg.rel_missing_warn_ratio,
+            missing_fail_ratio=cfg.rel_missing_fail_ratio,
+        )
+
+        rel_items: list[dict[str, Any]] = []
+        for edge in edges_df.to_dict(orient="records"):
+            rel_items.append(
+                run_rel_missing_for_edge(
+                    dfs=dfs,
+                    edge_row=edge,
+                    profiles_df=profiles_df,
+                    cfg=cfg_rm,
+                    sample_n=cfg.rel_missing_sample_n,
+                )
+            )
+        rel_missing_df = rel_missing_summary_to_df(rel_items)
+
+    # 7) duplicates (optional)
+    dup_out: dict[str, pd.DataFrame] = {}
+    if cfg.duplicates_enabled:
+        dup_cfg = DuplicateChecksConfig(
+            relational_duplicate_subset_keys=(cfg.duplicate_subset_keys or {}),
+            relationship_tables=(cfg.duplicate_relationship_tables or {}),
+        )
+        dup_out = run_duplicate_checks(dfs, cfg=dup_cfg)
+
+    # 8) default fk values (optional)
+    default_fk_df = pd.DataFrame()
+    default_fk_raw: list[dict[str, Any]] = []
+    if cfg.default_fk_enabled and (edges_df is not None and not edges_df.empty):
+        dfk_cfg = cfg.default_fk_cfg or DefaultFKConfig()
+        default_fk_raw = run_default_fk_for_edges(
+            dfs=dfs,
+            edges_df=edges_df,
+            cfg=dfk_cfg,
+            sample_n=cfg.default_fk_sample_n,
+        )
+        default_fk_df = default_fk_summary_to_df(default_fk_raw)
+
+    # 9) surrogate keys (optional)
+    surrogate_keys_out: dict[str, Any] = {"items": []}
+    if cfg.surrogate_keys_enabled:
+        sk_cfg = cfg.surrogate_keys_cfg or SurrogateKeyConfig()
+        surrogate_keys_out = annotate_surrogate_keys(
+            dfs=dfs,
+            profiles_df=profiles_df,
+            edges_df=edges_df,
+            ucc_df=ucc_df,
+            cfg=sk_cfg,
+        )
+
+    # 10) composite ucc (optional)
+    composite_ucc_df = pd.DataFrame()
+    if cfg.composite_ucc_enabled:
+        composite_ucc_df = discover_ucc_composite(
+            dfs=dfs,
+            profiles_df=profiles_df,
+            ucc_unary_df=ucc_df,
+            edges_df=edges_df,
+            cfg=CompositeUCCConfig(
+                max_k=cfg.composite_ucc_max_k,
+                max_cols_per_table=cfg.composite_ucc_max_cols_per_table,
+            ),
+        )
+
+    # 11) recommendations (lightweight decision layer)
+    out_bundle: dict[str, Any] = {
+        "profiles_df": profiles_df,
+        "profile_extras": profile_extras,
+        "ucc_df": ucc_df,
+        "composite_ucc_df": composite_ucc_df,
+        "edges_df": edges_df,
+        "rel_missing_df": rel_missing_df,
+        "duplicates": dup_out,
+        "default_fk_df": default_fk_df,
+        "surrogate_keys": surrogate_keys_out,
+    }
+
+    recommendations = build_schema_recommendations(
+        dfs=dfs,
+        out=out_bundle,
+        normalisation_policy={
+            "null_tokens_mapped": ["", "null", "none", "n/a", "na"],
+            "trim_whitespace": True,
+            "casefold_strings": True,
+            "remove_punctuation": False,
+        },
+        top_n_alternatives=3,
+    )
+
+    return {
+        "profiles_df": profiles_df,
+        "profile_extras": profile_extras,
+        "ucc_df": ucc_df,
+        "ind_df": ind_df,
+        "scored_df": scored_df,
+        "edges_df": edges_df,
+        "rel_missing_df": rel_missing_df,
+        "duplicates": dup_out,
+        "default_fk_df": default_fk_df,
+        "default_fk_raw": default_fk_raw,
+        "surrogate_keys": surrogate_keys_out,
+        "composite_ucc_df": composite_ucc_df,
+        "recommendations": recommendations,
+    }
+
+
+================================================================================
+
+schema_discovery/profiling/profiler.py:
+
+"""
+Unified profiler for schema discovery.
+
+This replaces:
+- column_profiler.py (basic)
+- enhanced_profiler.py (enhanced)
+
+Contract (must stay valid):
+- discover_ucc_unary(profiles_df) requires:
+  table_name, column_name, dtype_family, n_rows, unique_ratio, null_ratio (+ optional is_unary_ucc)
+- discover_ind_unary(..., profiles_df) requires:
+  table_name, column_name, dtype_family, null_ratio, n_rows, n_unique, unique_ratio
+
+Design:
+- mode="basic" -> compute only required fields cheaply (pandas dtype families)
+- mode="enhanced" -> still compute required fields, but use AtomicDtypeModelV2 for dtype_family
+  and compute extra metrics (quality, numeric/date stats, etc)
+- Never mutates dfs
+"""
+
+from __future__ import annotations
+
+from dataclasses import asdict
+from typing import Any, Optional, Literal
+
+import numpy as np
+import pandas as pd
+
+from schema_discovery.profiling.atomic_model import AtomicDtypeModelV2, InferenceConfig, AtomicDType
+from schema_discovery.quality.key_normalisation import normalise_null_like
+
+ProfileMode = Literal["basic", "enhanced"]
+
+
+# -----------------------------
+# Helpers (shared)
+# -----------------------------
+def _dtype_family_from_pandas(dtype: Any) -> str:
+    if pd.api.types.is_bool_dtype(dtype):
+        return "bool"
+    if pd.api.types.is_integer_dtype(dtype):
+        return "int"
+    if pd.api.types.is_float_dtype(dtype):
+        return "float"
+    if pd.api.types.is_datetime64_any_dtype(dtype):
+        return "datetime"
+    if pd.api.types.is_string_dtype(dtype) or pd.api.types.is_object_dtype(dtype):
+        return "string"
+    return "other"
+
+def _top1_ratio(s: pd.Series) -> float:
+    """
+    Ratio of the most frequent value among non-null values.
+    0.0 means empty or no non-null values.
+    """
+    vals = s.dropna()
+    if vals.empty:
+        return 0.0
+    vc = vals.value_counts(normalize=True, dropna=True)
+    if vc.empty:
+        return 0.0
+    return float(vc.iloc[0])
+
+
+def _dtype_family_from_atomic(at: AtomicDType) -> str:
+    if at is AtomicDType.BOOL:
+        return "bool"
+    if at is AtomicDType.INT:
+        return "int"
+    if at is AtomicDType.FLOAT:
+        return "float"
+    if at is AtomicDType.DATE:
+        return "datetime"
+    return "string"
+
+
+def _safe_nunique(s: pd.Series) -> int:
+    return int(s.nunique(dropna=True))
+
+
+def _sample_values(s: pd.Series, k: int = 5) -> list[str]:
+    if k <= 0:
+        return []
+    vals = s.dropna()
+    if vals.empty:
+        return []
+    uniq = vals.drop_duplicates().head(k)
+    return [str(x) for x in uniq.tolist()]
+
+
+def _string_length_stats(s: pd.Series) -> dict[str, float | None]:
+    vals = s.dropna()
+    if vals.empty:
+        return {"avg_len": None, "min_len": None, "max_len": None}
+    lens = vals.astype(str).map(len)
+    return {
+        "avg_len": float(lens.mean()),
+        "min_len": float(lens.min()),
+        "max_len": float(lens.max()),
+    }
+
+def _health_check(
+    *,
+    dtype_family: str,
+    n_rows: int,
+    n_null: int,
+    n_unique: int,
+    unique_ratio_non_null: float,
+    avg_len: float | None,
+    min_len: float | None,
+    max_len: float | None,
+) -> tuple[str, str, list[str], int]:
+    """
+    Return (status, severity, reasons, score).
+    score is 0..100 where 100 is best.
+    """
+    if n_rows <= 0:
+        return "fail", "high", ["empty_table_or_column"], 0
+
+    null_ratio = (n_null / n_rows) if n_rows else 1.0
+    non_null = n_rows - n_null
+
+    reasons: list[str] = []
+    score = 100
+
+    # Nullness signals
+    if null_ratio >= 0.95:
+        reasons.append("mostly_null")
+        score -= 50
+    elif null_ratio >= 0.50:
+        reasons.append("high_null_ratio")
+        score -= 25
+    elif null_ratio >= 0.20:
+        reasons.append("moderate_null_ratio")
+        score -= 10
+
+    # Low information columns
+    if non_null > 0 and n_unique <= 1:
+        reasons.append("constant_or_near_constant")
+        score -= 35
+
+    # String hygiene
+    if dtype_family == "string" and non_null > 0:
+        if avg_len is not None and avg_len == 0:
+            reasons.append("empty_strings_dominate")
+            score -= 25
+
+        # suspicious if huge length spread (often free text mixed with codes)
+        if min_len is not None and max_len is not None and min_len >= 0 and max_len >= 0:
+            if max_len - min_len >= 50:
+                reasons.append("high_length_variance")
+                score -= 10
+
+    # Key-ish signal: very high uniqueness but with nulls
+    # this often means "id column with missing values" -> warn
+    if non_null > 0 and unique_ratio_non_null >= 0.99 and n_null > 0:
+        reasons.append("near_unique_but_has_nulls")
+        score -= 10
+
+    score = int(max(0, min(100, score)))
+
+    # Map to status / severity
+    if score >= 85:
+        return "ok", "low", reasons, score
+
+    if score >= 70:
+        return "warn", "low", reasons, score
+
+    if score >= 40:
+        return "warn", "medium", reasons, score
+
+    return "fail", "high", reasons, score
+
+
+# -----------------------------
+# Enhanced-only helpers
+# -----------------------------
+def _pk_continuity_int(series_numeric: pd.Series) -> float | None:
+    valid = series_numeric.dropna()
+    if valid.empty:
+        return None
+    try:
+        arr = np.sort(pd.unique(valid))
+        if arr.size < 2:
+            return 100.0
+        min_val, max_val = int(arr[0]), int(arr[-1])
+        expected = (max_val - min_val + 1)
+        if expected <= 0:
+            return None
+        missing = expected - int(arr.size)
+        continuity = 1.0 - (missing / expected)
+        return float(np.clip(continuity * 100.0, 0.0, 100.0))
+    except Exception:
+        return None
+
+
+def _freshness_score(max_date: pd.Timestamp) -> float | None:
+    try:
+        now = pd.Timestamp.now(tz=max_date.tz) if max_date.tzinfo else pd.Timestamp.now()
+        age_days = (now - max_date).days
+        score = 100.0 - (age_days / 365.0) * 100.0
+        return float(np.clip(score, 0.0, 100.0))
+    except Exception:
+        return None
+
+
+def _consistency_score(series: pd.Series, dtype_family: str) -> float:
+    valid = series.dropna()
+    if valid.empty:
+        return 0.0
+
+    try:
+        if dtype_family in {"int", "float"}:
+            x = pd.to_numeric(valid, errors="coerce").dropna()
+            if x.empty:
+                return 40.0
+            mean = float(x.mean())
+            std = float(x.std()) if len(x) > 1 else 0.0
+            if mean == 0.0:
+                return 90.0
+            cv = abs(std / mean) if mean != 0 else 0.0
+            return float(np.clip((1.0 - min(cv, 1.0)) * 100.0, 0.0, 100.0))
+
+        if dtype_family == "string":
+            s = valid.astype(str)
+            lengths = s.str.len()
+            mean_len = float(lengths.mean()) if len(lengths) else 0.0
+            std_len = float(lengths.std()) if len(lengths) > 1 else 0.0
+            length_cv = (std_len / mean_len) if mean_len > 0 else 0.0
+            length_score = float(np.clip((1.0 - min(length_cv, 1.0)) * 100.0, 0.0, 100.0))
+
+            sample = s.head(min(200, len(s)))
+            patt = []
+            for v in sample:
+                if not v:
+                    continue
+                a = sum(c.isalpha() for c in v) / len(v)
+                d = sum(c.isdigit() for c in v) / len(v)
+                patt.append((a, d))
+            if not patt:
+                return length_score
+
+            a_std = float(np.std([p[0] for p in patt]))
+            d_std = float(np.std([p[1] for p in patt]))
+            pattern_score = float(np.clip((1.0 - min((a_std + d_std) / 2.0, 1.0)) * 100.0, 0.0, 100.0))
+            return float((length_score + pattern_score) / 2.0)
+
+        if dtype_family == "datetime":
+            dt = pd.to_datetime(valid, errors="coerce").dropna()
+            if len(dt) < 2:
+                return 100.0
+            dt_sorted = dt.sort_values()
+            diffs = dt_sorted.diff().dropna()
+            if diffs.empty:
+                return 100.0
+            secs = diffs.dt.total_seconds()
+            mean = float(secs.mean())
+            std = float(secs.std()) if len(secs) > 1 else 0.0
+            if mean == 0.0:
+                return 90.0
+            cv = abs(std / mean) if mean != 0 else 0.0
+            return float(np.clip((1.0 - min(cv, 1.0)) * 100.0, 0.0, 100.0))
+
+        if dtype_family == "bool":
+            vc = valid.value_counts(normalize=True)
+            if len(vc) < 2:
+                return 20.0
+            minority = float(min(vc.values))
+            return float(np.clip(minority * 200.0, 0.0, 100.0))
+
+        return 70.0
+    except Exception:
+        return 50.0
+
+
+def _numeric_stats(series: pd.Series) -> dict[str, Any]:
+    x = pd.to_numeric(series, errors="coerce").dropna()
+    if x.empty:
+        return {
+            "mean": None,
+            "median": None,
+            "min": None,
+            "max": None,
+            "std_dev": None,
+            "q25": None,
+            "q75": None,
+            "iqr": None,
+            "skewness": None,
+        }
+
+    q25 = x.quantile(0.25)
+    q75 = x.quantile(0.75)
+    return {
+        "mean": float(x.mean()),
+        "median": float(x.median()),
+        "min": float(x.min()),
+        "max": float(x.max()),
+        "std_dev": float(x.std()) if len(x) > 1 else 0.0,
+        "q25": float(q25),
+        "q75": float(q75),
+        "iqr": float(q75 - q25),
+        "skewness": float(x.skew()) if len(x) > 2 else 0.0,
+    }
+
+
+def _date_stats(series: pd.Series) -> dict[str, Any]:
+    dt = pd.to_datetime(series, errors="coerce").dropna()
+    if dt.empty:
+        return {
+            "date_min": None,
+            "date_max": None,
+            "date_range_days": None,
+            "freshness_score": None,
+        }
+    dt_sorted = dt.sort_values()
+    mn = dt_sorted.min()
+    mx = dt_sorted.max()
+    rng = (mx - mn).days
+    return {
+        "date_min": mn.isoformat(),
+        "date_max": mx.isoformat(),
+        "date_range_days": int(rng),
+        "freshness_score": _freshness_score(mx),
+    }
+
+
+# -----------------------------
+# Public API
+# -----------------------------
+def profile_table(
+    df: pd.DataFrame,
+    table_name: str,
+    *,
+    sample_k: int = 5,
+    mode: ProfileMode = "basic",
+    atomic_cfg: Optional[InferenceConfig] = None,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """
+    Profile a single table.
+
+    Returns:
+    -> profiles_df: one row per column (always includes required base columns)
+    -> extras: table-level metadata (empty in basic mode)
+    """
+    if not isinstance(df, pd.DataFrame):
+        raise TypeError("df must be a pandas DataFrame")
+
+    mode = str(mode).lower()
+    if mode not in ("basic", "enhanced"):
+        raise ValueError("mode must be 'basic' or 'enhanced'")
+
+    n_rows = int(len(df))
+
+    # Only fit atomic model in enhanced mode (expensive part)
+    schema = None
+    cfg = None
+    if mode == "enhanced":
+        cfg = atomic_cfg or InferenceConfig(profile=False)
+        atomic_model = AtomicDtypeModelV2(cfg).fit(df)
+        schema = atomic_model.schema()  # name -> ColumnInference
+
+    rows: list[dict[str, Any]] = []
+    extras_columns: dict[str, Any] = {}
+
+    for col in df.columns:
+        s_raw = df[col]
+        col_name = str(col)
+
+        # ---- base stats (always computed) ----
+        s_clean = normalise_null_like(s_raw)
+
+        n_null = int(s_clean.isna().sum())
+        n_non_null = int(n_rows - n_null)
+        null_ratio = (n_null / n_rows) if n_rows else 0.0
+
+        # Uniqueness should be computed over non-null values
+        s_non_null = s_clean.dropna()
+        n_unique = int(s_non_null.nunique(dropna=True))
+
+        top1_ratio = _top1_ratio(s_clean)
+
+        unique_ratio = (n_unique / n_rows) if n_rows else 0.0
+        unique_ratio_non_null = (n_unique / n_non_null) if n_non_null else 0.0
+
+        is_unary_ucc = (n_rows > 0) and (n_null == 0) and (n_unique == n_rows)
+
+
+        # dtype_family decision depends on mode
+        if mode == "enhanced" and schema is not None:
+            inf = schema.get(col_name)
+            if inf is None:
+                atomic_type = AtomicDType.STRING
+                atomic_prob = 0.0
+                atomic_reason = "Missing inference result"
+                convertible_ratio = 0.0
+            else:
+                atomic_type = inf.atomic_type
+                atomic_prob = float(inf.confidence)
+                atomic_reason = str(inf.reason)
+                convertible_ratio = float(inf.convertible_ratio)
+
+            dtype_family = _dtype_family_from_atomic(atomic_type)
+        else:
+            atomic_type = None
+            atomic_prob = None
+            atomic_reason = None
+            convertible_ratio = None
+            dtype_family = _dtype_family_from_pandas(s_raw.dtype)
+
+        # length stats only meaningful for string family
+        if dtype_family == "string":
+            len_stats = _string_length_stats(s_clean)
+        else:
+            len_stats = {"avg_len": None, "min_len": None, "max_len": None}
+
+        health_status, health_severity, health_reasons, health_score = _health_check(
+            dtype_family=dtype_family,
+            n_rows=n_rows,
+            n_null=n_null,
+            n_unique=n_unique,
+            unique_ratio_non_null=float(unique_ratio_non_null),
+            avg_len=len_stats["avg_len"],
+            min_len=len_stats["min_len"],
+            max_len=len_stats["max_len"],
+        )
+
+
+        row: dict[str, Any] = {
+            # Required base columns (match your old profiler schema)
+            "table_name": str(table_name),
+            "column_name": col_name,
+            "column_key": f"{table_name}.{col_name}",
+            "dtype": str(s_raw.dtype),
+            "dtype_family": dtype_family,
+            "n_rows": n_rows,
+            "n_null": n_null,
+            "n_non_null": n_non_null,
+            "null_ratio": float(null_ratio),
+            "n_unique": int(n_unique),
+            "unique_ratio": float(unique_ratio),
+            "unique_ratio_non_null": float(unique_ratio_non_null),
+            "is_unary_ucc": bool(is_unary_ucc),
+            "sample_values": _sample_values(s_clean, k=sample_k),
+            "avg_len": len_stats["avg_len"],
+            "min_len": len_stats["min_len"],
+            "max_len": len_stats["max_len"],
+            "health_status": health_status,
+            "health_severity": health_severity,
+            "health_score": int(health_score),
+            "health_reasons": health_reasons,
+            "top1_ratio": float(top1_ratio),
+
+        }
+
+        # ---- enhanced extras (only if mode == enhanced) ----
+        if mode == "enhanced":
+            completeness = float((n_non_null / n_rows) * 100.0) if n_rows else 100.0
+            consistency = _consistency_score(s_clean, dtype_family)
+            uniqueness_pct = float(np.clip(unique_ratio * 100.0, 0.0, 100.0))
+            overall_quality = float(np.clip(float(np.mean([completeness, uniqueness_pct, consistency])), 0.0, 100.0))
+
+            pk_cont = None
+            num_stats: dict[str, Any] = {}
+            date_info: dict[str, Any] = {}
+
+            if dtype_family == "int":
+                x = pd.to_numeric(s_clean, errors="coerce")
+                pk_cont = _pk_continuity_int(x)
+                num_stats = _numeric_stats(s_clean)
+            elif dtype_family == "float":
+                num_stats = _numeric_stats(s_clean)
+            elif dtype_family == "datetime":
+                date_info = _date_stats(s_clean)
+
+            row.update(
+                {
+                    "atomic_type": atomic_type.value if atomic_type is not None else None,
+                    "atomic_prob": atomic_prob,
+                    "atomic_convertible_ratio": convertible_ratio,
+                    "atomic_reason": atomic_reason,
+                    "completeness": completeness,
+                    "consistency_score": consistency,
+                    "overall_quality": overall_quality,
+                    "pk_continuity": pk_cont,
+                }
+            )
+
+            for k, v in num_stats.items():
+                row[f"num_{k}"] = v
+
+            for k, v in date_info.items():
+                row[k] = v
+
+            extras_columns[col_name] = {
+                "dtype_family": dtype_family,
+                "atomic_type": atomic_type.value if atomic_type is not None else "string",
+                "atomic_prob": float(atomic_prob) if atomic_prob is not None else 0.0,
+                "atomic_reason": atomic_reason or "",
+                "quality": {
+                    "completeness": completeness,
+                    "consistency_score": consistency,
+                    "overall_quality": overall_quality,
+                },
+            }
+
+        rows.append(row)
+
+    profiles_df = (
+        pd.DataFrame(rows)
+        .sort_values(["table_name", "column_name"], kind="mergesort")
+        .reset_index(drop=True)
+    )
+
+    health_counts = profiles_df["health_status"].value_counts(dropna=False).to_dict()
+
+
+    extras: dict[str, Any] = {}
+    if mode == "enhanced":
+        extras = {
+            "table_name": str(table_name),
+            "n_rows": n_rows,
+            "n_cols": int(df.shape[1]),
+            "atomic_config": asdict(cfg) if cfg is not None else {},
+            "columns": extras_columns,
+        }
+
+    # Always attach health (cheap + useful)
+    extras["health"] = {
+        "counts": health_counts,
+        "avg_score": float(profiles_df["health_score"].mean()) if "health_score" in profiles_df.columns else None,
+    }
+    return profiles_df, extras
+
+
+def profile_all_tables(
+    dfs: dict[str, pd.DataFrame],
+    *,
+    sample_k: int = 5,
+    mode: ProfileMode = "basic",
+    atomic_cfg: Optional[InferenceConfig] = None,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    if not isinstance(dfs, dict) or not dfs:
+        raise ValueError("dfs must be a non-empty dict[str, DataFrame]")
+
+    frames: list[pd.DataFrame] = []
+    extras: dict[str, Any] = {"tables": {}}  # ALWAYS
+
+    for table_name, df in dfs.items():
+        t_profiles, t_extras = profile_table(
+            df,
+            table_name=str(table_name),
+            sample_k=sample_k,
+            mode=mode,
+            atomic_cfg=atomic_cfg,
+        )
+        frames.append(t_profiles)
+        extras["tables"][str(table_name)] = t_extras  # ALWAYS
+
+    out = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    out = out.sort_values(["table_name", "column_name"], kind="mergesort").reset_index(drop=True)
+
+    # Optional: global health rollup across all tables
+    try:
+        scores = []
+        for tname, tex in extras["tables"].items():
+            h = tex.get("health", {})
+            if isinstance(h, dict) and h.get("avg_score") is not None:
+                scores.append(float(h["avg_score"]))
+        extras["health"] = {"avg_score": float(np.mean(scores)) if scores else None}
+    except Exception:
+        extras["health"] = {"avg_score": None}
+
+    return out, extras
+
+
+
+================================================================================
+
+schema_discovery/quality/key_normalisation.py:
+
+from __future__ import annotations
+
+import re
+import numpy as np
+import pandas as pd
+
+
+# Keep this list deliberate. If you add too many, you'll erase legitimate codes.
+DEFAULT_NULL_TOKENS: set[str] = {
+    "",  # after strip
+     "n/a", "n\\a",
+    "nan", "-nan",
+    "null", "none", "nil",
+    "<na>", "<n/a>",
+    "#n/a", "#n/a n/a", "#na",
+    "-1.#ind", "1.#ind",
+    "-1.#qnan", "1.#qnan",
+}
+
+
+_ws_re = re.compile(r"\s+")
+
+
+def normalise_null_like(
+    s: pd.Series,
+    *,
+    null_tokens: set[str] | None = None,
+    lowercase: bool = True,
+    collapse_ws: bool = True,
+    strip: bool = True,
+) -> pd.Series:
+    """
+    Convert common string placeholders for missing values into real missing (pd.NA).
+
+    This does NOT drop rows. It only replaces values with pd.NA.
+    """
+    if null_tokens is None:
+        null_tokens = DEFAULT_NULL_TOKENS
+
+    out = s.copy()
+
+    # Only touch non-null values
+    mask = ~pd.isna(out)
+    if not mask.any():
+        return out
+
+    tmp = out.loc[mask].astype(str)
+
+    if collapse_ws:
+        tmp = tmp.map(lambda x: _ws_re.sub(" ", x))
+    if strip:
+        tmp = tmp.str.strip()
+    if lowercase:
+        tmp_cmp = tmp.str.lower()
+    else:
+        tmp_cmp = tmp
+
+    is_null = tmp_cmp.isin(null_tokens)
+    if is_null.any():
+        out.loc[tmp.index[is_null]] = pd.NA
+
+    return out
+
+
+def norm_key_series(
+    s: pd.Series,
+    *,
+    normalise_string_nulls: bool = True,
+    null_tokens: set[str] | None = None,
+) -> pd.Series:
+    """
+    Normalise key columns so FK/PK comparisons are stable.
+
+    - Optionally converts string placeholders for nulls -> pd.NA
+    - Drops nulls (real + converted)
+    - Normalises integer-like floats (999999.0 -> 999999)
+    - Preserves non-integer numeric keys
+    - Falls back to string keys for mixed / object columns
+    """
+    if normalise_string_nulls:
+        s = normalise_null_like(s, null_tokens=null_tokens)
+
+    s = s.dropna()
+
+    if s.empty:
+        # Keep consistent dtype for downstream comparisons
+        return s.astype(object)
+
+    if pd.api.types.is_numeric_dtype(s):
+        x = pd.to_numeric(s, errors="coerce").dropna()
+        if x.empty:
+            return s.astype("string").str.strip().astype(object)
+
+        # All integer-like -> cast safely
+        arr = x.to_numpy()
+        if np.isclose(arr, np.round(arr)).all():
+            return x.round().astype("Int64").astype(object)
+
+        return x.astype(object)
+
+    # object / string-like
+    # strip is still useful even if normalise_string_nulls=False
+    return s.astype("string").str.strip().astype(object)
+
+================================================================================
+
+schema_discovery/quality/key_representations.py:
+
+# schema_discovery/quality/key_representations.py
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Dict, Optional
+
+import numpy as np
+import pandas as pd
+
+
+@dataclass(frozen=True)
+class KeyRepConfig:
+    # Float or numeric token -> int string if "enough" values are integer-like.
+    # This avoids failing the whole rep because of a few junk tokens.
+    int_like_tol: float = 1e-9
+    int_like_min_frac: float = 0.98  # require >= 98% integer-like among parseable numerics
+    min_parseable_numeric_frac: float = 0.50  # if too few values parse as numeric -> skip numeric reps
+
+    # Zfill variants
+    enable_zfill: bool = True
+    max_zfill_width: int = 18
+
+    # Prevent silly numeric conversions
+    max_abs_int: int = 2_147_483_647  # guard overflow-ish / very large IDs, adjust if needed
+
+
+def _to_string(series: pd.Series) -> pd.Series:
+    return series.astype("string")
+
+
+def _strip(series: pd.Series) -> pd.Series:
+    s = _to_string(series).str.strip()
+    # Treat empty string as missing
+    s = s.where(s.str.len() > 0)
+    return s
+
+
+def _numeric_coerce(series: pd.Series) -> pd.Series:
+    """
+    Convert tokens to numeric where possible. Returns float series with NaN for non-parseable.
+    """
+    s = series
+    if pd.api.types.is_numeric_dtype(s):
+        return pd.to_numeric(s, errors="coerce")
+    tok = _to_string(s).str.strip()
+    return pd.to_numeric(tok, errors="coerce")
+
+
+def _num_int_str(series: pd.Series, cfg: KeyRepConfig) -> pd.Series:
+    """
+    Canonical integer string representation for integer-like numeric tokens.
+    - Converts only if enough values are numeric and integer-like.
+    - Non-parseable or non-integer-like tokens become <NA>.
+    """
+    s = _strip(series)
+    num = _numeric_coerce(s)
+
+    out = pd.Series(pd.array([pd.NA] * len(s), dtype="string"), index=s.index)
+
+    parseable = num.notna()
+    if not parseable.any():
+        return out
+
+    parseable_frac = float(parseable.mean())
+    if parseable_frac < float(cfg.min_parseable_numeric_frac):
+        return out
+
+    vals = num.loc[parseable].to_numpy(dtype=np.float64, copy=False)
+    int_like = np.isclose(vals, np.round(vals), atol=float(cfg.int_like_tol))
+    int_like_frac = float(int_like.mean()) if len(int_like) else 0.0
+
+    if int_like_frac < float(cfg.int_like_min_frac):
+        # too many fractional numbers -> not a safe integer-key rep
+        return out
+
+    # Only emit for int-like values. Others -> NA.
+    ok_idx = num.loc[parseable].index[int_like]
+    ints = np.round(num.loc[ok_idx].to_numpy(dtype=np.float64, copy=False)).astype(np.int64)
+
+    # guard huge values (optional but helps avoid "1e20" nonsense becoming int)
+    if cfg.max_abs_int is not None:
+        mask_ok = np.abs(ints) <= int(cfg.max_abs_int)
+        ok_idx = ok_idx[mask_ok]
+        ints = ints[mask_ok]
+
+    out.loc[ok_idx] = pd.Series(ints.astype(str), index=ok_idx, dtype="string")
+    return out
+
+
+def _infer_zfill_width(a: pd.Series, b: pd.Series, max_width: int) -> Optional[int]:
+    """
+    Infer a reasonable padding width from digit-only tokens across both series.
+    Uses max digit length observed, capped.
+    """
+    def _max_len_digits(s: pd.Series) -> int:
+        s = _strip(s).dropna()
+        if s.empty:
+            return 0
+        d = s[s.str.fullmatch(r"\d+")]
+        if d.empty:
+            return 0
+        return int(d.str.len().max())
+
+    w = max(_max_len_digits(a), _max_len_digits(b))
+    if w <= 1:
+        return None
+    if w > int(max_width):
+        return None
+    return int(w)
+
+
+def _zfill(series: pd.Series, width: int) -> pd.Series:
+    s = _strip(series)
+    out = s.copy()
+    mask = s.notna() & s.str.fullmatch(r"\d+")
+    out.loc[mask] = s.loc[mask].str.zfill(int(width))
+    return out
+
+def _digits_lstrip_zeros(series: pd.Series) -> pd.Series:
+    """
+    For digit-only tokens, remove leading zeros.
+    Keeps "0" as "0".
+    Non-digit tokens -> <NA>.
+    """
+    s = _strip(series)
+    out = pd.Series(pd.array([pd.NA] * len(s), dtype="string"), index=s.index)
+
+    mask = s.notna() & s.str.fullmatch(r"\d+")
+    if not mask.any():
+        return out
+
+    vals = s.loc[mask].astype("string")
+    stripped = vals.str.lstrip("0")
+    stripped = stripped.where(stripped.str.len() > 0, "0")
+
+    out.loc[mask] = stripped
+    return out
+
+def build_key_representations(
+    series: pd.Series,
+    *,
+    other: Optional[pd.Series] = None,
+    cfg: Optional[KeyRepConfig] = None,
+) -> Dict[str, pd.Series]:
+    """
+    Named representations used by soft IND matching.
+    Keep this small and deliberate to avoid combinatorial explosion.
+    """
+    cfg = cfg or KeyRepConfig()
+
+    reps: Dict[str, pd.Series] = {}
+    reps["raw_str"] = _strip(series)
+
+    reps["num_int_str"] = _num_int_str(series, cfg)
+
+    # Handles 0000000775 vs 775 style joins
+    reps["digits_lstrip_zeros"] = _digits_lstrip_zeros(series)
+
+    if cfg.enable_zfill and other is not None:
+        width = _infer_zfill_width(series, other, cfg.max_zfill_width)
+        if width is not None:
+            reps[f"zfill_{width}"] = _zfill(series, width)
+            reps[f"num_int_str_zfill_{width}"] = _zfill(reps["num_int_str"], width)
+
+    return reps
+
+
+================================================================================
+
+schema_discovery/scoring/fk_score.py:
+
+"""
+FK candidate scoring.
+
+Takes unary IND candidates and assigns a confidence score using evidence:
+- distinct coverage and row coverage (strongest signals)
+- name similarity as a weak bonus (helps break ties)
+- range penalty for int-like IDs to reduce accidental inclusions
+  (e.g., small-domain values being included in a broad sequential parent key)
+
+This module does not select final edges. It only scores candidates.
+"""
+
+from __future__ import annotations
+
+import re
+from functools import lru_cache
+
+import numpy as np
+import pandas as pd
+
+
+def _norm_name(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(s).strip().lower())
+
+# Tokens that appear in many "key" columns but carry almost no meaning.
+_STOP_TOKENS = frozenset({
+    "id", "no", "num", "number",
+    "code", "key", "ref", "seq",
+    "uid", "uuid", "guid",
+})
+
+@lru_cache(maxsize=2048)
+def _tokens_cached(raw: str) -> frozenset[str]:
+    raw = str(raw).strip()
+    parts = re.split(r"[^A-Za-z0-9]+", raw)
+    toks = []
+    for p in parts:
+        if not p:
+            continue
+        camel = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", p).split()
+        toks.extend(camel)
+
+    toks = [_norm_name(t) for t in toks if _norm_name(t)]
+    # NEW: drop generic tokens
+    toks = [t for t in toks if t not in _STOP_TOKENS]
+
+    return frozenset(toks)
+
+def name_similarity(a: str, b: str) -> float:
+    na, nb = _norm_name(a), _norm_name(b)
+    if not na or not nb:
+        return 0.0
+    if na == nb:
+        return 1.0
+
+    ta, tb = _tokens_cached(a), _tokens_cached(b)
+
+    # if both became empty after stopwords, treat as no signal
+    if not ta or not tb:
+        return 0.0
+
+    j = len(ta & tb) / len(ta | tb)
+
+    sub = 0.65 if (na in nb or nb in na) else 0.0
+    return float(max(j, sub))
+
+
+def _range_penalty_from_minmax(
+    df: pd.DataFrame,
+    fk_distinct_small_max: int = 2000,
+) -> pd.Series:
+    """
+    Compute a penalty in [0, 0.95] based on how much wider the parent range is
+    compared to the child range.
+
+    To reduce false positives, this penalty matters most when the FK domain is small.
+    If fk_distinct is large, accidental inclusion is less likely, so we scale the
+    penalty down.
+
+    Only applies when fk_min/fk_max/pk_min/pk_max exist (int-like IDs).
+    For string IDs those fields are null and the penalty is 0.
+    """
+    needed = ["fk_min", "fk_max", "pk_min", "pk_max"]
+    mask = df[needed].notna().all(axis=1)
+
+    pen = pd.Series(0.0, index=df.index, dtype="float64")
+    if not mask.any():
+        return pen
+
+    sub = df.loc[mask]
+
+    fk_range = (sub["fk_max"] - sub["fk_min"] + 1).astype(float).clip(lower=1.0)
+    pk_range = (sub["pk_max"] - sub["pk_min"] + 1).astype(float).clip(lower=1.0)
+
+    ratio = (pk_range / fk_range).clip(lower=1.0)
+    logr = np.log10(ratio.to_numpy())
+
+    # base penalty 0..1 with smooth saturation
+    p = logr / (1.0 + logr)
+    p = np.nan_to_num(p, nan=0.0, posinf=0.95, neginf=0.0)
+    p = np.clip(p, 0.0, 0.95)
+
+    # scale down penalty as fk_distinct grows
+    if "fk_distinct" in sub.columns:
+        fk_dist = sub["fk_distinct"].astype(float).clip(lower=1.0)
+        # 1.0 when small, decays toward 0 as fk_distinct grows
+        scale = np.minimum(1.0, float(fk_distinct_small_max) / fk_dist.to_numpy())
+        p = p * scale
+
+    pen.loc[mask] = p
+    return pen.clip(0.0, 0.95)
+
+def _small_domain_penalty(
+    df: pd.DataFrame,
+    *,
+    fk_distinct_max: int = 30,
+    distinct_cov_min: float = 0.95,
+    min_name_sim_to_exempt: float = 0.30,
+) -> pd.Series:
+    """
+    Penalise accidental inclusions from very small FK domains ONLY when the
+    column name does not support it being an FK.
+
+    This keeps true small FKs like SupplierID -> SupplierID.
+    """
+    fk_dist = df["fk_distinct"].astype(float)
+    dc = df["distinct_coverage"].astype(float)
+
+    # if name_sim exists, use it. If not, assume 0.
+    ns = df["name_sim"].astype(float) if "name_sim" in df.columns else pd.Series(0.0, index=df.index)
+
+    # penalise small domain only when:
+    # -> small distinct
+    # -> near perfect inclusion
+    # -> and name similarity is weak
+    bad = (fk_dist <= float(fk_distinct_max)) & (dc >= float(distinct_cov_min)) & (ns < float(min_name_sim_to_exempt))
+
+    return bad.astype(float)
+
+def _has_measure_tokens(col: str) -> bool:
+    s = str(col).strip().lower()
+    tokens = [
+        "minute", "min", "time", "second",
+        "day", "month", "year",
+        "age", "score", "rating",
+        "stage", "round", "week",
+        "status", "flag", "type",
+        "count", "qty", "quantity",
+        "amount", "price", "total",
+    ]
+    return any(t in s for t in tokens)
+
+def _looks_like_id(col: str) -> bool:
+    s = str(col).strip().lower()
+    return (s == "id") or s.endswith("id") or s.endswith("_id") or s.endswith("key_id")
+
+def _measure_to_surrogate_penalty(
+    df: pd.DataFrame,
+    *,
+    fk_max_small_cap: int = 500,
+    fk_distinct_small_cap: int = 500,
+    strong_cov: float = 0.99,
+) -> pd.Series:
+    """
+    Penalise cases where a measure-like FK column (minute, status, month, etc.)
+    is perfectly included in a surrogate-like parent key domain.
+    """
+    fk_name = df["fk_column"].astype("string")
+    pk_name = df["pk_column"].astype("string")
+
+    fk_measure = fk_name.map(_has_measure_tokens).fillna(False).astype("bool")
+    fk_is_id   = fk_name.map(_looks_like_id).fillna(False).astype("bool")
+    pk_is_id   = pk_name.map(_looks_like_id).fillna(False).astype("bool")
+
+    d = df["distinct_coverage"].astype(float)
+    r = df["row_coverage"].astype(float)
+
+    # Use min/max when available, otherwise treat as not small bounded.
+    fk_max = pd.to_numeric(df.get("fk_max"), errors="coerce")
+    fk_dist = pd.to_numeric(df.get("fk_distinct"), errors="coerce")
+
+    small_bounded = (fk_max.notna()) & (fk_max <= float(fk_max_small_cap)) & (fk_dist.notna()) & (fk_dist <= float(fk_distinct_small_cap))
+    perfectish = (d >= float(strong_cov)) & (r >= float(strong_cov))
+
+    bad = fk_measure & (~fk_is_id) & pk_is_id & small_bounded & perfectish
+    return bad.astype(float)
+
+
+def score_ind_candidates(
+    ind_df: pd.DataFrame,
+    w_distinct: float = 0.75,
+    w_row: float = 0.20,
+    w_name: float = 0.05,
+    w_range_penalty: float = 0.10,
+    fk_distinct_small_max: int = 2000,
+    w_small_domain_penalty: float = 0.20,
+    small_fk_distinct_max: int = 30,
+    small_distinct_cov_min: float = 0.95,
+    w_measure_penalty: float = 0.60,
+) -> pd.DataFrame:
+    required = {
+        "fk_table", "fk_column", "pk_table", "pk_column",
+        "distinct_coverage", "row_coverage",
+        "fk_distinct", "pk_distinct", "intersection_distinct",
+        "fk_min", "fk_max", "pk_min", "pk_max",
+    }
+    missing = required - set(ind_df.columns)
+    if missing:
+        raise ValueError(f"ind_df missing required columns: {sorted(missing)}")
+
+    # basic weight sanity checks (no auto-normalisation to avoid changing behaviour)
+    for name, w in [
+        ("w_distinct", w_distinct),
+        ("w_row", w_row),
+        ("w_name", w_name),
+        ("w_range_penalty", w_range_penalty),
+    ]:
+        if float(w) < 0.0:
+            raise ValueError(f"{name} must be >= 0")
+
+    df = ind_df.copy()
+
+    # weak semantic signal (bonus, not a gate)
+    df["name_sim"] = [
+        name_similarity(fk, pk) for fk, pk in zip(df["fk_column"], df["pk_column"])
+    ]
+
+    # penalty against accidental inclusions (only for int-like min/max rows)
+    df["range_penalty"] = _range_penalty_from_minmax(df, fk_distinct_small_max=fk_distinct_small_max)
+
+    df["measure_penalty"] = _measure_to_surrogate_penalty(df)
+
+    # ensure numeric
+    d = df["distinct_coverage"].astype(float)
+    r = df["row_coverage"].astype(float)
+    ns = df["name_sim"].astype(float)
+    rp = df["range_penalty"].astype(float)
+
+    df["small_domain_penalty"] = _small_domain_penalty(
+        df,
+        fk_distinct_max=small_fk_distinct_max,
+        distinct_cov_min=small_distinct_cov_min,
+    )
+
+    sdp = df["small_domain_penalty"].astype(float)
+
+    mp = df["measure_penalty"].astype(float)
+
+    df["score"] = (
+        float(w_distinct) * d
+        + float(w_row) * r
+        + float(w_name) * ns
+        - float(w_range_penalty) * rp
+        - float(w_small_domain_penalty) * sdp
+        - float(w_measure_penalty) * mp
+    ).clip(0.0, 1.0)
+
+    return (
+        df.sort_values(
+            by=["fk_table", "fk_column", "score", "distinct_coverage", "row_coverage", "name_sim"],
+            ascending=[True, True, False, False, False, False],
+            kind="mergesort",
+        )
+        .reset_index(drop=True)
+    )
+
+
+================================================================================
+
+schema_discovery/selection/select_edges.py:
+
+"""
+Edge selection.
+
+Takes scored FK candidates and selects one best parent per (fk_table, fk_column),
+then classifies relationship type (many_to_one vs one_to_one, optional vs required).
+
+Key change (Option A):
+- Keep useful evidence columns in the final edges output so the API can return them.
+"""
+
+from __future__ import annotations
+
+import pandas as pd
+
+
+def select_best_edges(
+    scored_df: pd.DataFrame,
+    profiles_df: pd.DataFrame,
+    min_score: float = 0.80,
+    optional_null_ratio_min: float = 0.01,
+    one_to_one_unique_ratio_min: float = 0.999999,
+    max_edges_per_fk: int = 3,
+) -> pd.DataFrame:
+    required_scored = {
+        "fk_table", "fk_column", "pk_table", "pk_column",
+        "score", "distinct_coverage", "row_coverage",
+        "fk_distinct", "fk_non_null_rows",
+    }
+    missing = required_scored - set(scored_df.columns)
+    if missing:
+        raise ValueError(f"scored_df missing required columns: {sorted(missing)}")
+
+    required_prof = {"table_name", "column_name", "null_ratio", "unique_ratio"}
+    missing_prof = required_prof - set(profiles_df.columns)
+    if missing_prof:
+        raise ValueError(f"profiles_df missing required columns: {sorted(missing_prof)}")
+
+    # 1) Filter by minimum score
+    df = scored_df[scored_df["score"] >= float(min_score)].copy()
+    if df.empty:
+        return pd.DataFrame(columns=[
+            "relationship",
+            "fk_table", "fk_column", "pk_table", "pk_column",
+            "score", "distinct_coverage", "row_coverage",
+            "cardinality", "optional",
+        ])
+
+    # 2) Pick best parent per FK column
+    sort_cols = ["fk_table", "fk_column", "score", "distinct_coverage", "row_coverage"]
+    sort_asc = [True, True, False, False, False]
+    if "name_sim" in df.columns:
+        sort_cols.append("name_sim")
+        sort_asc.append(False)
+
+    df = df.sort_values(by=sort_cols, ascending=sort_asc, kind="mergesort")
+    df = df.groupby(["fk_table", "fk_column"], as_index=False).head(int(max_edges_per_fk)).reset_index(drop=True)
+
+    # 3) Attach FK stats (optional + cardinality)
+    prof_lookup = profiles_df.set_index(["table_name", "column_name"])
+
+    def _get_stat(t: str, c: str, field: str, default: float = 0.0) -> float:
+        try:
+            return float(prof_lookup.loc[(t, c), field])
+        except Exception:
+            return float(default)
+
+    optional_flags = []
+    cardinalities = []
+
+    for r in df.itertuples(index=False):
+        fk_null_ratio = _get_stat(r.fk_table, r.fk_column, "null_ratio", default=0.0)
+
+        # Prefer non-null uniqueness if available
+        if "unique_ratio_non_null" in profiles_df.columns:
+            fk_unique_ratio = _get_stat(r.fk_table, r.fk_column, "unique_ratio_non_null", default=0.0)
+        else:
+            fk_unique_ratio = _get_stat(r.fk_table, r.fk_column, "unique_ratio", default=0.0)
+
+        optional_flags.append(fk_null_ratio >= float(optional_null_ratio_min))
+        cardinalities.append(
+            "one_to_one" if fk_unique_ratio >= float(one_to_one_unique_ratio_min) else "many_to_one"
+        )
+
+    df["optional"] = optional_flags
+    df["cardinality"] = cardinalities
+
+    # 4) Display string
+    df["relationship"] = df["fk_table"] + "." + df["fk_column"] + " -> " + df["pk_table"] + "." + df["pk_column"]
+
+    # 5) Keep base fields + preserve useful evidence if present
+    base_keep = [
+        "relationship",
+        "fk_table", "fk_column",
+        "pk_table", "pk_column",
+        "score", "distinct_coverage", "row_coverage",
+        "cardinality", "optional",
+    ]
+
+    extra_if_present = [
+        # evidence
+        "fk_non_null_rows", "fk_distinct", "pk_distinct", "intersection_distinct", "matched_rows",
+        # scoring extras
+        "name_sim", "range_penalty",
+        # min/max if you ever want to expose it later
+        "fk_min", "fk_max", "pk_min", "pk_max",
+    ]
+
+    keep = base_keep + [c for c in extra_if_present if c in df.columns]
+
+    return (
+        df[keep]
+        .sort_values(by=["score", "distinct_coverage", "row_coverage"], ascending=[False, False, False], kind="mergesort")
+        .reset_index(drop=True)
+    )
+
+
+
+================================================================================
+
+schema_discovery/viz/erd_graphviz.py:
+
+from __future__ import annotations
+
+import pandas as pd
+
+
+def edges_to_dot(edges_df: pd.DataFrame, show_labels: bool = True) -> str:
+    """
+    Convert edges_df (fk_table,fk_column,pk_table,pk_column,optional,cardinality,score,mode)
+    into a Graphviz DOT string usable by st.graphviz_chart().
+
+    Node colouring:
+      - Parent only (appears only as pk_table) -> green-ish
+      - Child only  (appears only as fk_table) -> blue-ish
+      - Both (appears as pk_table and fk_table) -> light grey
+
+    Edge styling:
+      - optional=True -> dashed
+      - mode=="soft"  -> dashed if optional is missing, otherwise keeps optional dash
+      - score         -> thicker penwidth
+    """
+    required = {"fk_table", "pk_table"}
+    missing = required - set(edges_df.columns)
+    if missing:
+        raise ValueError(f"edges_df missing required columns: {sorted(missing)}")
+
+    # --- role sets
+    pk_tables = set(edges_df["pk_table"].astype(str))
+    fk_tables = set(edges_df["fk_table"].astype(str))
+    tables = sorted(pk_tables | fk_tables)
+
+    # --- colour palette (tweak freely)
+    COLOR_PARENT = "#57B5F3"  # light green
+    COLOR_CHILD = "#4DF347"   # light blue
+    COLOR_BOTH = "#DA6DFC"    # light grey
+    COLOR_BORDER = "#d3bbbb"
+    COLOR_EDGE = "#aab6cc"
+
+    def _node_fill(t: str) -> str:
+        is_parent = t in pk_tables
+        is_child = t in fk_tables
+        if is_parent and not is_child:
+            return COLOR_PARENT
+        if is_child and not is_parent:
+            return COLOR_CHILD
+        if is_parent and is_child:
+            return COLOR_BOTH
+        return "#ffffff"
+
+    # --- DOT header
+    lines = [
+        "digraph ERD {",
+        '  rankdir="LR";',
+        '  graph [bgcolor="#ffffff", pad="0.2", nodesep="0.4", ranksep="0.6"];',
+        '  node  [shape=box, style="rounded,filled", color="%s", fontname="Helvetica"];' % COLOR_BORDER,
+        '  edge  [color="%s", fontname="Helvetica", fontsize=10];' % COLOR_EDGE,
+        "",
+    ]
+
+    # --- nodes with per-table colour
+    for t in tables:
+        fill = _node_fill(t)
+        # quote names to handle weird characters safely
+        lines.append(f'  "{t}" [fillcolor="{fill}"];')
+
+    lines.append("")
+
+    # --- edges
+    has_optional = "optional" in edges_df.columns
+    has_mode = "mode" in edges_df.columns
+    has_score = "score" in edges_df.columns
+    has_pk_col = "pk_column" in edges_df.columns
+    has_fk_col = "fk_column" in edges_df.columns
+
+    for r in edges_df.itertuples(index=False):
+        pk_t = str(getattr(r, "pk_table"))
+        fk_t = str(getattr(r, "fk_table"))
+
+        pk_c = str(getattr(r, "pk_column")) if has_pk_col else ""
+        fk_c = str(getattr(r, "fk_column")) if has_fk_col else ""
+
+        label = ""
+        if show_labels and (pk_c or fk_c):
+            label = f"{pk_c} -> {fk_c}".strip(" ->")
+
+        # Optional relationship -> dashed edge
+        optional = bool(getattr(r, "optional", False)) if has_optional else False
+
+        # Soft edges (if you output mode) -> also dashed (but do not override optional)
+        mode = str(getattr(r, "mode", "")).lower() if has_mode else ""
+        is_soft = mode == "soft"
+
+        # Style logic:
+        # - if optional True -> dashed
+        # - else if soft -> dashed (so you can visually spot soft links)
+        edge_style = ""
+        if optional or is_soft:
+            edge_style = 'style="dashed"'
+
+        # arrow
+        arrow = 'arrowhead="normal" arrowtail="none"'
+
+        # Score -> thicker line (clipped range)
+        if has_score:
+            try:
+                score = float(getattr(r, "score"))
+                score_clipped = max(0.0, min(1.0, score))
+                penwidth = 1.0 + 4.0 * score_clipped
+            except Exception:
+                penwidth = 1.5
+        else:
+            penwidth = 1.5
+
+        attrs = [arrow, f'penwidth="{penwidth:.2f}"']
+        if edge_style:
+            attrs.append(edge_style)
+        if label:
+            safe_label = label.replace('"', r"\"")
+            attrs.append(f'label="{safe_label}"')
+
+        lines.append(f'  "{pk_t}" -> "{fk_t}" [{", ".join(attrs)}];')
+
+    # --- (Optional) tiny legend as nodes (kept simple)
+    lines += [
+        "",
+        '  subgraph cluster_legend {',
+        '    label="Legend";',
+        '    fontsize=10;',
+        '    color="#e5e7eb";',
+        '    style="rounded";',
+        '    "Parent only" [shape=box, style="rounded,filled", fillcolor="%s"];' % COLOR_PARENT,
+        '    "Child only"  [shape=box, style="rounded,filled", fillcolor="%s"];' % COLOR_CHILD,
+        '    "Both"        [shape=box, style="rounded,filled", fillcolor="%s"];' % COLOR_BOTH,
+        '  }',
+    ]
+
+    lines.append("}")
+    return "\n".join(lines)
+
+================================================================================
+
